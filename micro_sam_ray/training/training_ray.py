@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader, Dataset
 
 import ray
+import ray.train
 from ray.train import ScalingConfig
 from ray.train.torch import TorchTrainer
 
@@ -166,189 +167,221 @@ def _filter_warnings(ignore_warnings):
         with nullcontext():
             yield
 
+def train_sam_worker(train_config: Dict):
+    """Worker function for distributed SAM training using Ray."""
 
-def train_sam(
+    # Unpack config
+    name = train_config["name"]
+    model_type = train_config["model_type"]
+    train_loader = train_config["train_loader"]
+    val_loader = train_config["val_loader"]
+    n_epochs = train_config.get("n_epochs", 100)
+    early_stopping = train_config.get("early_stopping", 10)
+    n_objects_per_batch = train_config.get("n_objects_per_batch", 25)
+    checkpoint_path = train_config.get("checkpoint_path", None)
+    with_segmentation_decoder = train_config.get("with_segmentation_decoder", True)
+    freeze = train_config.get("freeze", None)
+    device = train_config.get("device", None)
+    lr = train_config.get("lr", 1e-5)
+    n_sub_iteration = train_config.get("n_sub_iteration", 8)
+    save_root = train_config.get("save_root", None)
+    mask_prob = train_config.get("mask_prob", 0.5)
+    n_iterations = train_config.get("n_iterations", None)
+    scheduler_class = train_config.get("scheduler_class", torch.optim.lr_scheduler.ReduceLROnPlateau)
+    scheduler_kwargs = train_config.get("scheduler_kwargs", None)
+    optimizer_class = train_config.get("optimizer_class", torch.optim.AdamW)
+    peft_kwargs = train_config.get("peft_kwargs", None)
+    model_kwargs = train_config.get("model_kwargs", {})
+
+    t_start = time.time()
+
+    # Check loaders
+    _check_loader(train_loader, with_segmentation_decoder, "train")
+    _check_loader(val_loader, with_segmentation_decoder, "val")
+
+    # Prepare data loaders for distributed training
+    train_loader = ray.train.torch.prepare_data_loader(train_loader)
+    val_loader = ray.train.torch.prepare_data_loader(val_loader)
+
+    device = get_device(device)
+
+    # Get the trainable segment anything model
+    model, state = get_trainable_sam_model(
+        model_type=model_type,
+        device=device,
+        freeze=freeze,
+        checkpoint_path=checkpoint_path,
+        return_state=True,
+        peft_kwargs=peft_kwargs,
+        **model_kwargs
+    )
+
+    # Prepare model for distributed training
+    model = ray.train.torch.prepare_model(model)
+
+    # Create inputs converter
+    convert_inputs = ConvertToSamInputs(transform=model.transform, box_distortion_factor=0.025)
+
+    # Set up optimizer and scheduler kwargs
+    if scheduler_kwargs is None:
+        scheduler_kwargs = {"mode": "min", "factor": 0.9, "patience": 3, "verbose": True}
+
+    # Handle segmentation decoder case
+    if with_segmentation_decoder:
+        # Get the UNETR
+        unetr = get_unetr(
+            image_encoder=model.sam.image_encoder,
+            decoder_state=state.get("decoder_state", None),
+            device=device,
+        )
+        unetr = ray.train.torch.prepare_model(unetr)
+
+        # Get the parameters for SAM and the decoder from UNETR
+        joint_model_params = [params for params in model.parameters()]  # sam parameters
+        for param_name, params in unetr.named_parameters():  # unetr's decoder parameters
+            if not param_name.startswith("encoder"):
+                joint_model_params.append(params)
+
+        optimizer = optimizer_class(joint_model_params, lr=lr)
+        scheduler = scheduler_class(optimizer=optimizer, **scheduler_kwargs)
+
+        # Set up trainer with instance segmentation
+        instance_seg_loss = torch_em.loss.DiceBasedDistanceLoss(mask_distances_in_bg=True)
+        trainer = joint_trainers.JointSamTrainer(
+            name=name,
+            save_root=save_root,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            lr_scheduler=scheduler,
+            logger=joint_trainers.JointSamLogger,
+            log_image_interval=100,
+            mixed_precision=True,
+            convert_inputs=convert_inputs,
+            n_objects_per_batch=n_objects_per_batch,
+            n_sub_iteration=n_sub_iteration,
+            compile_model=False,
+            unetr=unetr,
+            instance_loss=instance_seg_loss,
+            instance_metric=instance_seg_loss,
+            early_stopping=early_stopping,
+            mask_prob=mask_prob,
+        )
+    else:
+        # Set up standard SAM trainer
+        optimizer = optimizer_class(model.parameters(), lr=lr)
+        scheduler = scheduler_class(optimizer=optimizer, **scheduler_kwargs)
+        
+        trainer = trainers.SamTrainer(
+            name=name,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            lr_scheduler=scheduler,
+            logger=trainers.SamLogger,
+            log_image_interval=100,
+            mixed_precision=True,
+            convert_inputs=convert_inputs,
+            n_objects_per_batch=n_objects_per_batch,
+            n_sub_iteration=n_sub_iteration,
+            compile_model=False,
+            early_stopping=early_stopping,
+            mask_prob=mask_prob,
+            save_root=save_root,
+        )
+
+    # Set up training parameters
+    if n_iterations is None:
+        trainer_fit_params = {"epochs": n_epochs}
+    else:
+        trainer_fit_params = {"iterations": n_iterations}
+
+    # Training loop
+    for epoch in range(n_epochs):
+        if ray.train.get_context().get_world_size() > 1:
+            # Required for distributed sampling
+            train_loader.sampler.set_epoch(epoch)
+        
+        # Run training iteration
+        train_metrics = trainer.train_iteration()
+        val_metrics = trainer.validate()
+        
+        # Report metrics to Ray
+        metrics = {
+            "epoch": epoch,
+            "train_loss": train_metrics["loss"],
+            "val_loss": val_metrics["loss"],
+        }
+        
+        # Add additional metrics if available
+        if "instance_loss" in train_metrics:
+            metrics["train_instance_loss"] = train_metrics["instance_loss"]
+        if "instance_loss" in val_metrics:
+            metrics["val_instance_loss"] = val_metrics["instance_loss"]
+        
+        # Report metrics to Ray
+        ray.train.report(metrics)
+        
+        # Handle early stopping
+        if trainer.early_stopping is not None:
+            if trainer.early_stopping.should_stop():
+                print(f"Early stopping triggered at epoch {epoch}")
+                break
+
+    # Print training time
+    t_run = time.time() - t_start
+    hours = int(t_run // 3600)
+    minutes = int((t_run % 3600) // 60)
+    seconds = int(round(t_run % 60, 0))
+    print(f"Training took {t_run} seconds (= {hours:02}:{minutes:02}:{seconds:02} hours)")
+
+
+def train_sam_distributed(
     name: str,
     model_type: str,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    n_epochs: int = 100,
-    early_stopping: Optional[int] = 10,
-    n_objects_per_batch: Optional[int] = 25,
-    checkpoint_path: Optional[Union[str, os.PathLike]] = None,
-    with_segmentation_decoder: bool = True,
-    freeze: Optional[List[str]] = None,
-    device: Optional[Union[str, torch.device]] = None,
-    lr: float = 1e-5,
-    n_sub_iteration: int = 8,
-    save_root: Optional[Union[str, os.PathLike]] = None,
-    mask_prob: float = 0.5,
-    n_iterations: Optional[int] = None,
-    scheduler_class: Optional[_LRScheduler] = torch.optim.lr_scheduler.ReduceLROnPlateau,
-    scheduler_kwargs: Optional[Dict[str, Any]] = None,
-    save_every_kth_epoch: Optional[int] = None,
-    pbar_signals: Optional[QObject] = None,
-    optimizer_class: Optional[Optimizer] = torch.optim.AdamW,
-    peft_kwargs: Optional[Dict] = None,
-    ignore_warnings: bool = True,
-    verify_n_labels_in_loader: Optional[int] = 50,
-    **model_kwargs,
-) -> None:
-    """Run training for a SAM model.
+    num_workers: int = 2,
+    use_gpu: bool = True,
+    **train_kwargs
+    ) -> None:
+    """Distributed training wrapper for SAM using Ray."""
 
-    Args:
-        name: The name of the model to be trained.
-            The checkpoint and logs wil have this name.
-        model_type: The type of the SAM model.
-        train_loader: The dataloader for training.
-        val_loader: The dataloader for validation.
-        n_epochs: The number of epochs to train for.
-        early_stopping: Enable early stopping after this number of epochs
-            without improvement.
-        n_objects_per_batch: The number of objects per batch used to compute
-            the loss for interative segmentation. If None all objects will be used,
-            if given objects will be randomly sub-sampled.
-        checkpoint_path: Path to checkpoint for initializing the SAM model.
-        with_segmentation_decoder: Whether to train additional UNETR decoder
-            for automatic instance segmentation.
-        freeze: Specify parts of the model that should be frozen, namely:
-            image_encoder, prompt_encoder and mask_decoder
-            By default nothing is frozen and the full model is updated.
-        device: The device to use for training.
-        lr: The learning rate.
-        n_sub_iteration: The number of iterative prompts per training iteration.
-        save_root: Optional root directory for saving the checkpoints and logs.
-            If not given the current working directory is used.
-        mask_prob: The probability for using a mask as input in a given training sub-iteration.
-        n_iterations: The number of iterations to use for training. This will over-ride n_epochs if given.
-        scheduler_class: The learning rate scheduler to update the learning rate.
-            By default, torch.optim.lr_scheduler.ReduceLROnPlateau is used.
-        scheduler_kwargs: The learning rate scheduler parameters.
-            If passed None, the chosen default parameters are used in ReduceLROnPlateau.
-        save_every_kth_epoch: Save checkpoints after every kth epoch separately.
-        pbar_signals: Controls for napari progress bar.
-        optimizer_class: The optimizer class.
-            By default, torch.optim.AdamW is used.
-        peft_kwargs: Keyword arguments for the PEFT wrapper class.
-        verify_n_labels_in_loader: The number of labels to verify out of the train and validation dataloaders.
-            By default, 50 batches of labels are verified from the dataloaders.
-        model_kwargs: Additional keyword arguments for the `util.get_sam_model`.
-        ignore_warnings: Whether to ignore raised warnings.
-    """
-    with _filter_warnings(ignore_warnings):
+    # Initialize Ray if not already initialized
+    if not ray.is_initialized():
+        ray.init()
 
-        t_start = time.time()
+    # Prepare training configuration
+    train_config = {
+        "name": name,
+        "model_type": model_type,
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        **train_kwargs
+    }
 
-        _check_loader(train_loader, with_segmentation_decoder, "train", verify_n_labels_in_loader)
-        _check_loader(val_loader, with_segmentation_decoder, "val", verify_n_labels_in_loader)
+    # Configure computation resources
+    scaling_config = ScalingConfig(
+        num_workers=num_workers,
+        use_gpu=use_gpu
+    )
 
-        device = get_device(device)
-        # Get the trainable segment anything model.
-        model, state = get_trainable_sam_model(
-            model_type=model_type,
-            device=device,
-            freeze=freeze,
-            checkpoint_path=checkpoint_path,
-            return_state=True,
-            peft_kwargs=peft_kwargs,
-            **model_kwargs
-        )
-        # This class creates all the training data for a batch (inputs, prompts and labels).
-        convert_inputs = ConvertToSamInputs(transform=model.transform, box_distortion_factor=0.025)
+    # Initialize the Ray TorchTrainer
+    trainer = TorchTrainer(
+        train_loop_per_worker=train_sam_worker,
+        train_loop_config=train_config,
+        scaling_config=scaling_config,
+    )
 
-        # Create the UNETR decoder (if train with it) and the optimizer.
-        if with_segmentation_decoder:
-
-            # Get the UNETR.
-            unetr = get_unetr(
-                image_encoder=model.sam.image_encoder,
-                decoder_state=state.get("decoder_state", None),
-                device=device,
-            )
-
-            # Get the parameters for SAM and the decoder from UNETR.
-            joint_model_params = [params for params in model.parameters()]  # sam parameters
-            for param_name, params in unetr.named_parameters():  # unetr's decoder parameters
-                if not param_name.startswith("encoder"):
-                    joint_model_params.append(params)
-
-            optimizer = optimizer_class(joint_model_params, lr=lr)
-
-        else:
-            optimizer = optimizer_class(model.parameters(), lr=lr)
-
-        if scheduler_kwargs is None:
-            scheduler_kwargs = {"mode": "min", "factor": 0.9, "patience": 3, "verbose": True}
-
-        scheduler = scheduler_class(optimizer=optimizer, **scheduler_kwargs)
-
-        # The trainer which performs training and validation.
-        if with_segmentation_decoder:
-            instance_seg_loss = torch_em.loss.DiceBasedDistanceLoss(mask_distances_in_bg=True)
-            trainer = joint_trainers.JointSamTrainer(
-                name=name,
-                save_root=save_root,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                model=model,
-                optimizer=optimizer,
-                device=device,
-                lr_scheduler=scheduler,
-                logger=joint_trainers.JointSamLogger,
-                log_image_interval=100,
-                mixed_precision=True,
-                convert_inputs=convert_inputs,
-                n_objects_per_batch=n_objects_per_batch,
-                n_sub_iteration=n_sub_iteration,
-                compile_model=False,
-                unetr=unetr,
-                instance_loss=instance_seg_loss,
-                instance_metric=instance_seg_loss,
-                early_stopping=early_stopping,
-                mask_prob=mask_prob,
-            )
-        else:
-            trainer = trainers.SamTrainer(
-                name=name,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                model=model,
-                optimizer=optimizer,
-                device=device,
-                lr_scheduler=scheduler,
-                logger=trainers.SamLogger,
-                log_image_interval=100,
-                mixed_precision=True,
-                convert_inputs=convert_inputs,
-                n_objects_per_batch=n_objects_per_batch,
-                n_sub_iteration=n_sub_iteration,
-                compile_model=False,
-                early_stopping=early_stopping,
-                mask_prob=mask_prob,
-                save_root=save_root,
-            )
-
-        if n_iterations is None:
-            trainer_fit_params = {"epochs": n_epochs}
-        else:
-            trainer_fit_params = {"iterations": n_iterations}
-
-        if save_every_kth_epoch is not None:
-            trainer_fit_params["save_every_kth_epoch"] = save_every_kth_epoch
-
-        if pbar_signals is not None:
-            progress_bar_wrapper = _ProgressBarWrapper(pbar_signals)
-            trainer_fit_params["progress"] = progress_bar_wrapper
-
-        trainer.fit(**trainer_fit_params)
-
-        t_run = time.time() - t_start
-        hours = int(t_run // 3600)
-        minutes = int(t_run // 60)
-        seconds = int(round(t_run % 60, 0))
-        print("Training took", t_run, f"seconds (= {hours:02}:{minutes:02}:{seconds:02} hours)")
-
-
+    # Start distributed training
+    result = trainer.fit()
+    print(f"Training completed with result: {result}")
+  
+  
 def _update_patch_shape(patch_shape, raw_paths, raw_key, with_channels):
     if isinstance(raw_paths, (str, os.PathLike)):
         path = raw_paths
@@ -484,23 +517,23 @@ def default_sam_dataset(
     return dataset
 
 
-def default_sam_loader(**kwargs) -> DataLoader:
-    """Create a PyTorch DataLoader for training a SAM model.
-
-    Args:
-        kwargs: Keyword arguments for `micro_sam.training.default_sam_dataset` or for the PyTorch DataLoader.
-
-    Returns:
-        The DataLoader.
-    """
+def default_sam_loader_distributed(**kwargs) -> DataLoader:
+    """Create a distributed DataLoader for training SAM with Ray."""
     sam_ds_kwargs, extra_kwargs = split_kwargs(default_sam_dataset, **kwargs)
 
-    # There might be additional parameters supported by `torch_em.default_segmentation_dataset`,
-    # which the users can provide to get their desired segmentation dataset.
-    extra_ds_kwargs, loader_kwargs = split_kwargs(torch_em.default_segmentation_dataset, **extra_kwargs)
-    ds_kwargs = {**sam_ds_kwargs, **extra_ds_kwargs}
+    # Get dataset
+    ds = default_sam_dataset(**sam_ds_kwargs)
 
-    ds = default_sam_dataset(**ds_kwargs)
+    # Add DistributedSampler for distributed training
+    sampler = torch.utils.data.DistributedSampler(ds)
+
+    # Update loader kwargs to use the distributed sampler
+    loader_kwargs = {
+        "sampler": sampler,
+        "shuffle": False,  # Shuffle is handled by DistributedSampler
+        **extra_kwargs
+    }
+
     return torch_em.segmentation.get_data_loader(ds, **loader_kwargs)
 
 
@@ -558,7 +591,7 @@ def train_sam_for_configuration(
             warnings.warn("You have specified a different model type.")
 
     train_kwargs.update(**kwargs)
-    train_sam(
+    train_sam_distributed(
         name=name, train_loader=train_loader, val_loader=val_loader,
         checkpoint_path=checkpoint_path, with_segmentation_decoder=with_segmentation_decoder,
         model_type=model_type, **train_kwargs
